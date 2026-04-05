@@ -163,6 +163,13 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 		opts.Set(cmd)
 	}
 
+	if cmd.Stdout == nil && cmd.Stderr == nil {
+		out, _, err := cmdOutput(cmd, true)
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, out)
+		}
+		return nil
+	}
 	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		return err
@@ -177,12 +184,12 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 
 	// When IO is set, runsc create forks child processes (runsc-sandbox,
 	// runsc-gofer) that inherit the command's stdout/stderr pipe FDs.
-	// After runsc create exits, these children keep the FDs open, so
-	// Go's cmd.Wait() (called by Monitor.Wait) blocks forever waiting
-	// for IO goroutines to drain the pipes to EOF.
-	// Fix: wait only for the process to exit, not for IO completion.
-	// The sandbox inherits the IO FDs and handles them directly.
-	// See google/gvisor#12198.
+	// Go's cmd.Wait() (used by Monitor.Wait) blocks forever because the
+	// IO goroutines wait for pipe EOF that never comes — the children
+	// keep the write-end FDs open.
+	// Fix: use cmd.Process.Wait() which only waits for process exit,
+	// not IO goroutine completion. The Monitor goroutine will race but
+	// the process is already reaped. See google/gvisor#12198.
 	if opts != nil && opts.IO != nil {
 		state, err := cmd.Process.Wait()
 		if err != nil {
@@ -193,6 +200,7 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 		}
 		return nil
 	}
+
 	status, err := Monitor.Wait(cmd, ec)
 	if err == nil && status != 0 {
 		err = fmt.Errorf("%s did not terminate successfully", cmd.Args[0])
