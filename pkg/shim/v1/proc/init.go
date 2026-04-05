@@ -262,9 +262,19 @@ func (p *Init) start(ctx context.Context, restoreConf *extension.RestoreConfig) 
 	go func() {
 		status, err := p.runtime.Wait(context.Background(), p.id)
 		if err != nil {
-			log.G(ctx).WithError(err).Errorf("Failed to wait for container %q", p.id)
-			p.killAllLocked(ctx)
-			status = internalErrorCode
+			// runsc wait may return an error like "sandbox no longer
+			// running and its exit status is unavailable" when the
+			// sandbox exits before runsc wait can retrieve the status.
+			// This is expected for short-lived containers. If status
+			// is 0 (container exited normally), ignore the error.
+			// See google/gvisor#12198.
+			if status != 0 {
+				log.G(ctx).WithError(err).Errorf("Failed to wait for container %q", p.id)
+				p.killAllLocked(ctx)
+				status = internalErrorCode
+			} else {
+				log.G(ctx).WithError(err).Warnf("Container %q wait returned error with status 0, ignoring", p.id)
+			}
 		}
 		ExitCh <- Exit{
 			Timestamp: time.Now(),
