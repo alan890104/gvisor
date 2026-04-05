@@ -163,9 +163,18 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
 		}
 		p.console = console
 	} else if !hasNoIO(r) {
-		if err := copyPipes(ctx, p.io, r.Stdin, r.Stdout, r.Stderr, &p.wg); err != nil {
-			return fmt.Errorf("failed to start io pipe copy: %w", err)
-		}
+		// Start IO pipe copy asynchronously. Opening FIFOs for writing
+		// blocks until a reader opens the other end, but containerd only
+		// opens FIFOs for reading AFTER Create() returns. Running
+		// copyPipes synchronously here causes a deadlock — the shim
+		// blocks on FIFO open, Create() never returns, containerd never
+		// opens the reader end. See google/gvisor#12198.
+		copyCtx := context.Background()
+		go func() {
+			if err := copyPipes(copyCtx, p.io, r.Stdin, r.Stdout, r.Stderr, &p.wg); err != nil {
+				log.G(ctx).WithError(err).Error("failed to start io pipe copy")
+			}
+		}()
 	}
 	pid, err := runc.ReadPidFile(pidFile)
 	if err != nil {
