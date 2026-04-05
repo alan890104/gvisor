@@ -161,52 +161,57 @@ func (r *Runsc) Create(context context.Context, id, bundle string, opts *CreateO
 	cmd := r.command(context, append(args, id)...)
 	if opts != nil && opts.IO != nil {
 		opts.Set(cmd)
-	}
 
-	if cmd.Stdout == nil && cmd.Stderr == nil {
-		out, _, err := cmdOutput(cmd, true)
-		if err != nil {
-			return fmt.Errorf("%w: %s", err, out)
+		// When IO is set, runsc create forks child processes
+		// (runsc-sandbox, runsc-gofer) that inherit stdout/stderr
+		// pipe FDs. Go's cmd.Wait() blocks forever waiting for IO
+		// goroutines to drain pipes to EOF — the children keep the
+		// write-end open. Bypass Monitor (which uses cmd.Wait) and
+		// wait only for process exit via cmd.Process.Wait().
+		// See google/gvisor#12198.
+		log.L.Debugf("Executing (IO path): %s", cmd.Args)
+		if err := cmd.Start(); err != nil {
+			return err
 		}
-		return nil
-	}
-	ec, err := Monitor.Start(cmd)
-	if err != nil {
-		return err
-	}
-	if opts != nil && opts.IO != nil {
 		if c, ok := opts.IO.(runc.StartCloser); ok {
 			if err := c.CloseAfterStart(); err != nil {
 				return err
 			}
 		}
-	}
-
-	// When IO is set, runsc create forks child processes (runsc-sandbox,
-	// runsc-gofer) that inherit the command's stdout/stderr pipe FDs.
-	// Go's cmd.Wait() (used by Monitor.Wait) blocks forever because the
-	// IO goroutines wait for pipe EOF that never comes — the children
-	// keep the write-end FDs open.
-	// Fix: use cmd.Process.Wait() which only waits for process exit,
-	// not IO goroutine completion. The Monitor goroutine will race but
-	// the process is already reaped. See google/gvisor#12198.
-	if opts != nil && opts.IO != nil {
-		state, err := cmd.Process.Wait()
+		ps, err := cmd.Process.Wait()
 		if err != nil {
 			return err
 		}
-		if !state.Success() {
-			return fmt.Errorf("%s did not terminate successfully: %s", cmd.Args[0], state)
+		if !ps.Success() {
+			return fmt.Errorf("%s did not terminate successfully: %s", cmd.Args[0], ps)
 		}
 		return nil
 	}
 
-	status, err := Monitor.Wait(cmd, ec)
-	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate successfully", cmd.Args[0])
+	// Non-IO path: runsc create with no container IO set.
+	// Same FD inheritance issue: cmdOutput/Monitor.Wait use cmd.Wait()
+	// which blocks on pipe EOF from child processes. Use devNull +
+	// Process.Wait() to avoid the deadlock.
+	// See google/gvisor#12198.
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return err
 	}
-
-	return err
+	defer devNull.Close()
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	log.L.Debugf("Executing (non-IO path): %s", cmd.Args)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	ps, err := cmd.Process.Wait()
+	if err != nil {
+		return err
+	}
+	if !ps.Success() {
+		return fmt.Errorf("%s did not terminate successfully: %s", cmd.Args[0], ps)
+	}
+	return nil
 }
 
 // Pause will pause a running container.
@@ -233,6 +238,28 @@ func (r *Runsc) Start(context context.Context, id string, cio runc.IO) error {
 func (r *Runsc) start(context context.Context, cio runc.IO, cmd *exec.Cmd) error {
 	if cio != nil {
 		cio.Set(cmd)
+
+		// Same fix as Create(): the sandbox holds PipeIO FDs open,
+		// so cmd.Wait() (via Monitor) blocks on pipe EOF forever.
+		// Use cmd.Start + Process.Wait to avoid the deadlock.
+		// See google/gvisor#12198.
+		log.L.Debugf("Executing: %s", cmd.Args)
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		if c, ok := cio.(runc.StartCloser); ok {
+			if err := c.CloseAfterStart(); err != nil {
+				return err
+			}
+		}
+		ps, err := cmd.Process.Wait()
+		if err != nil {
+			return err
+		}
+		if !ps.Success() {
+			return fmt.Errorf("%s did not terminate successfully: %s", cmd.Args[0], ps)
+		}
+		return nil
 	}
 
 	if cmd.Stdout == nil && cmd.Stderr == nil {
@@ -246,13 +273,6 @@ func (r *Runsc) start(context context.Context, cio runc.IO, cmd *exec.Cmd) error
 	ec, err := Monitor.Start(cmd)
 	if err != nil {
 		return err
-	}
-	if cio != nil {
-		if c, ok := cio.(runc.StartCloser); ok {
-			if err := c.CloseAfterStart(); err != nil {
-				return err
-			}
-		}
 	}
 	status, err := Monitor.Wait(cmd, ec)
 	if err == nil && status != 0 {

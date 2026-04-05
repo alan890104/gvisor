@@ -656,7 +656,12 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 	p.WorkDir = workDir
 	p.IoUID = int(options.IoUID)
 	p.IoGID = int(options.IoGID)
-	p.Sandbox = specutils.SpecContainerType(spec) == specutils.ContainerTypeSandbox
+	// Treat both explicit sandbox type AND unspecified type as sandbox.
+	// Non-CRI callers (BuildKit, ctr) don't set the container type
+	// annotation, resulting in ContainerTypeUnspecified. These are always
+	// root/sandbox containers that need IO FDs passed to runsc create.
+	ct := specutils.SpecContainerType(spec)
+	p.Sandbox = ct == specutils.ContainerTypeSandbox || ct == specutils.ContainerTypeUnspecified
 	p.UserLog = utils.UserLogPath(spec)
 	p.Monitor = reaper.Default
 	return p, nil
